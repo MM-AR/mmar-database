@@ -1506,6 +1506,7 @@ VALUES ('2df15b5e-6b43-4911-b38b-0fc5747a8ee6', 'File', NULL, '2024-11-24 15:10:
 INSERT INTO public.metaobject (uuid, name, description, creation_time, modification_time, geometry, coordinates_2d,
                                relative_coordinate_3d, absolute_coordinate_3d)
 VALUES ('a8e33bad-9eed-4a24-a4b2-406c5439d13a', 'Mechanism', NULL, '2025-03-20 15:10:11.789527',
+        '2025-03-20 15:10:11.789527', '', NULL, NULL, NULL);
 
 
 
