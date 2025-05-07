@@ -547,7 +547,7 @@ CREATE TABLE public.attribute
 (
     uuid_metaobject     uuid NOT NULL,
     multi_valued        boolean,
-    default_value character varying(256),
+    default_value       text,
     attribute_type_uuid uuid NOT NULL,
     facets              text,
     min                 integer,
@@ -1502,6 +1502,12 @@ INSERT INTO public.metaobject (uuid, name, description, creation_time, modificat
 VALUES ('2df15b5e-6b43-4911-b38b-0fc5747a8ee6', 'File', NULL, '2024-11-24 15:10:11.789527',
         '2024-11-24 15:10:11.789527', '', NULL, NULL, NULL);
 
+-- mechanism
+INSERT INTO public.metaobject (uuid, name, description, creation_time, modification_time, geometry, coordinates_2d,
+                               relative_coordinate_3d, absolute_coordinate_3d)
+VALUES ('a8e33bad-9eed-4a24-a4b2-406c5439d13a', 'Mechanism', NULL, '2025-03-20 15:10:11.789527',
+        '2025-03-20 15:10:11.789527', '', NULL, NULL, NULL);
+
 
 
 INSERT INTO public.users (uuid_metaobject, username, password, salt, token)
@@ -1530,7 +1536,9 @@ VALUES ('85897325-c2b3-4ca7-8902-8120300a08dc', true,
 -- file
 INSERT INTO public.attribute_type (uuid_metaobject, pre_defined, regex_value)
 VALUES ('2df15b5e-6b43-4911-b38b-0fc5747a8ee6', true, '^([\x09\x0A\x0D\x20-\x7E]|[\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})*$');
-
+-- mechanism
+INSERT INTO public.attribute_type (uuid_metaobject, pre_defined, regex_value)
+VALUES ('a8e33bad-9eed-4a24-a4b2-406c5439d13a', true, '^([\x09\x0A\x0D\x20-\x7E]|[\xC2-\xDF][\x80-\xBF]|\xE0[\xA0-\xBF][\x80-\xBF]|[\xE1-\xEC\xEE\xEF][\x80-\xBF]{2}|\xED[\x80-\x9F][\x80-\xBF]|\xF0[\x90-\xBF][\x80-\xBF]{2}|[\xF1-\xF3][\x80-\xBF]{3}|\xF4[\x80-\x8F][\x80-\xBF]{2})*$');
 
 SELECT pg_catalog.setval('logging.t_history_id_seq', 432, true);
 
