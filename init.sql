@@ -374,14 +374,29 @@ $$ LANGUAGE plpgsql;
 
 
 CREATE OR REPLACE FUNCTION public.delete_bendpoint_entries()
-    RETURNS TRIGGER AS
-$$
+ RETURNS trigger
+ LANGUAGE plpgsql
+AS $function$
+DECLARE
+    middle_uuids uuid[];
 BEGIN
-    DELETE FROM public.instance_object WHERE uuid IN (SELECT (unnest(OLD.line_points)::json ->> 'UUID')::uuid as uuid);
+    -- Extract the UUIDs from the line_points JSON array, ignoring first and last elements 
+    -- we ignore them since they are class instances that can exist on their own. -> thus, do not delete them
+    SELECT ARRAY(
+        SELECT (elem::json ->> 'UUID')::uuid
+        FROM unnest(OLD.line_points) WITH ORDINALITY AS t(elem, ord)
+        WHERE ord > 1 AND ord < array_length(OLD.line_points, 1)
+    ) INTO middle_uuids;
+
+    -- Delete entries for middle UUIDs
+    DELETE FROM public.instance_object WHERE uuid = ANY(middle_uuids);
+
+    -- Delete the from and to UUIDs as before
     DELETE FROM public.instance_object WHERE uuid = OLD.uuid_role_instance_from;
     DELETE FROM public.instance_object WHERE uuid = OLD.uuid_role_instance_to;
+
     RETURN OLD;
-end;
+END;
 
 $$ LANGUAGE plpgsql;
 
