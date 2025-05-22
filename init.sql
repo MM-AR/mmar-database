@@ -374,9 +374,8 @@ $$ LANGUAGE plpgsql;
 
 
 CREATE OR REPLACE FUNCTION public.delete_bendpoint_entries()
- RETURNS trigger
- LANGUAGE plpgsql
-AS $function$
+    RETURNS trigger AS 
+$$
 DECLARE
     middle_uuids uuid[];
 BEGIN
