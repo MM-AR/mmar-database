@@ -973,7 +973,8 @@ CREATE TABLE public.has_table_attribute
 (
     sequence            integer,
     uuid_attribute_type uuid NOT NULL,
-    uuid_attribute      uuid NOT NULL
+    uuid_attribute      uuid NOT NULL,
+    ui_component        text NOT NULL DEFAULT 'text'
 );
 
 
