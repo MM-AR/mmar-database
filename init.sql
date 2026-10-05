@@ -26,6 +26,29 @@ CREATE SCHEMA logging;
 ALTER SCHEMA logging OWNER TO api;
 
 --
+-- Name: current_app_user(); Type: FUNCTION; Schema: public; Owner: api
+--
+
+CREATE OR REPLACE FUNCTION public.current_app_user() RETURNS uuid
+    LANGUAGE plpgsql
+    STABLE
+AS
+$$
+BEGIN
+    -- The API server sets this per transaction, see set_config('mmar.uuid_user', ..., true).
+    -- Every connection of the pool authenticates as the same database role, so
+    -- CURRENT_USER cannot tell the platform users apart: this setting can.
+    RETURN NULLIF(current_setting('mmar.uuid_user', true), '')::uuid;
+EXCEPTION
+    WHEN others THEN
+        -- A malformed value must never abort the statement being audited.
+        RETURN NULL;
+END;
+$$;
+
+ALTER FUNCTION public.current_app_user() OWNER TO api;
+
+--
 -- Name: change_trigger(); Type: FUNCTION; Schema: public; Owner: api
 --
 
@@ -34,23 +57,25 @@ CREATE OR REPLACE FUNCTION public.change_trigger() RETURNS trigger
     SECURITY DEFINER
 AS
 $$
+DECLARE
+    acting_user uuid := public.current_app_user();
 BEGIN
     IF TG_OP = 'INSERT'
     THEN
-        INSERT INTO logging.t_history (tabname, schemaname, operation, new_val, transaction, affected_uuid)
-        VALUES (TG_RELNAME, TG_TABLE_SCHEMA, TG_OP, row_to_json(NEW), txid_current(), NEW.uuid);
+        INSERT INTO logging.t_history (tabname, schemaname, operation, new_val, transaction, affected_uuid, uuid_user)
+        VALUES (TG_RELNAME, TG_TABLE_SCHEMA, TG_OP, row_to_json(NEW), txid_current(), NEW.uuid, acting_user);
         RETURN NEW;
     ELSIF TG_OP = 'UPDATE'
     THEN
         NEW.modification_time = now();
-        INSERT INTO logging.t_history (tabname, schemaname, operation, new_val, old_val, transaction, affected_uuid)
-        VALUES (TG_RELNAME, TG_TABLE_SCHEMA, TG_OP, row_to_json(NEW), row_to_json(OLD), txid_current(), OLD.uuid);
+        INSERT INTO logging.t_history (tabname, schemaname, operation, new_val, old_val, transaction, affected_uuid, uuid_user)
+        VALUES (TG_RELNAME, TG_TABLE_SCHEMA, TG_OP, row_to_json(NEW), row_to_json(OLD), txid_current(), OLD.uuid, acting_user);
         RETURN NEW;
     ELSIF TG_OP = 'DELETE'
     THEN
         INSERT INTO logging.t_history
-            (tabname, schemaname, operation, old_val, transaction, affected_uuid)
-        VALUES (TG_RELNAME, TG_TABLE_SCHEMA, TG_OP, row_to_json(OLD), txid_current(), OLD.uuid);
+            (tabname, schemaname, operation, old_val, transaction, affected_uuid, uuid_user)
+        VALUES (TG_RELNAME, TG_TABLE_SCHEMA, TG_OP, row_to_json(OLD), txid_current(), OLD.uuid, acting_user);
         RETURN OLD;
     END IF;
 END;
@@ -108,10 +133,9 @@ BEGIN
                            FROM has_delete_right
                                     JOIN user_group ug ON has_delete_right.uuid_user_group = ug.uuid_metaobject
                                     JOIN has_user_user_group huug ON ug.uuid_metaobject = huug.uuid_user_group
-                           WHERE (has_delete_right.uuid_instance_object = p_uuid OR
-                                  has_delete_right.uuid_metaobject = p_uuid)
+                       WHERE has_delete_right.uuid_metaobject = p_uuid
                              AND huug.uuid_user = user_uuid)
-        OR user_uuid = 'ff892138-77e0-47fe-a323-3fe0e1bf0240';
+        OR public.is_administrator(user_uuid);
 
     IF NOT v_has_right THEN
         uuid := p_uuid;
@@ -417,16 +441,13 @@ $BODY$
 BEGIN
 
     IF (
-        user_uuid = 'ff892138-77e0-47fe-a323-3fe0e1bf0240'
+        public.is_administrator(user_uuid)
             OR user_uuid IS NULL
             OR EXISTS(SELECT 1
                       FROM has_delete_right
                                JOIN user_group ug ON has_delete_right.uuid_user_group = ug.uuid_metaobject
                                JOIN has_user_user_group huug ON ug.uuid_metaobject = huug.uuid_user_group
-                      WHERE (
-                          has_delete_right.uuid_instance_object = uuid_to_delete
-                              OR has_delete_right.uuid_metaobject = uuid_to_delete
-                          )
+                      WHERE has_delete_right.uuid_metaobject = uuid_to_delete
                         AND huug.uuid_user = user_uuid))
     THEN
         DELETE FROM metaobject WHERE uuid = uuid_to_delete;
@@ -468,7 +489,7 @@ CREATE TABLE logging.t_history
     schemaname    text,
     tabname       text,
     operation     text,
-    who           text                        DEFAULT CURRENT_USER,
+    uuid_user     uuid,
     new_val       json,
     old_val       json,
     affected_uuid uuid
@@ -483,6 +504,13 @@ ALTER TABLE logging.t_history
 --
 
 COMMENT ON COLUMN logging.t_history.affected_uuid IS 'This is the affected uuid by the operation';
+
+
+--
+-- Name: COLUMN t_history.uuid_user; Type: COMMENT; Schema: logging; Owner: api
+--
+
+COMMENT ON COLUMN logging.t_history.uuid_user IS 'The platform user that performed the operation, NULL when the change was not made through the API server';
 
 
 --
@@ -506,6 +534,119 @@ ALTER TABLE logging.t_history_id_seq
 --
 
 ALTER SEQUENCE logging.t_history_id_seq OWNED BY logging.t_history.id;
+
+
+--
+-- Name: t_security_event; Type: TABLE; Schema: logging; Owner: api
+--
+-- Authentication and privilege audit trail written by the API server.
+-- Deliberately has no foreign key on uuid_user: an audit record must survive the
+-- deletion of the account it refers to, and a failed sign in has no account at all.
+--
+
+CREATE TABLE logging.t_security_event
+(
+    id        bigint                   NOT NULL,
+    tstamp    timestamp with time zone DEFAULT now() NOT NULL,
+    event     text                     NOT NULL,
+    outcome   text                     NOT NULL,
+    uuid_user uuid,
+    username  text,
+    ip        text,
+    method    text,
+    path      text,
+    reason    text,
+    detail    jsonb,
+    CONSTRAINT t_security_event_outcome_check CHECK (outcome IN ('success', 'failure'))
+);
+
+
+ALTER TABLE logging.t_security_event
+    OWNER TO api;
+
+--
+-- Name: COLUMN t_security_event.event; Type: COMMENT; Schema: logging; Owner: api
+--
+
+COMMENT ON COLUMN logging.t_security_event.event IS 'The kind of event, for example login, token_verification, password_change, access_grant, access_revoke or access_denied';
+
+--
+-- Name: COLUMN t_security_event.uuid_user; Type: COMMENT; Schema: logging; Owner: api
+--
+
+COMMENT ON COLUMN logging.t_security_event.uuid_user IS 'The platform user concerned by the event, NULL when it could not be established';
+
+--
+-- Name: COLUMN t_security_event.username; Type: COMMENT; Schema: logging; Owner: api
+--
+
+COMMENT ON COLUMN logging.t_security_event.username IS 'The login that was attempted, kept even when no account matches it';
+
+--
+-- Name: t_security_event_id_seq; Type: SEQUENCE; Schema: logging; Owner: api
+--
+
+CREATE SEQUENCE logging.t_security_event_id_seq
+    AS bigint
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER TABLE logging.t_security_event_id_seq
+    OWNER TO api;
+
+--
+-- Name: t_security_event_id_seq; Type: SEQUENCE OWNED BY; Schema: logging; Owner: api
+--
+
+ALTER SEQUENCE logging.t_security_event_id_seq OWNED BY logging.t_security_event.id;
+
+
+--
+-- Name: t_security_event id; Type: DEFAULT; Schema: logging; Owner: api
+--
+
+ALTER TABLE ONLY logging.t_security_event
+    ALTER COLUMN id SET DEFAULT nextval('logging.t_security_event_id_seq'::regclass);
+
+
+--
+-- Name: t_security_event t_security_event_pkey; Type: CONSTRAINT; Schema: logging; Owner: api
+--
+
+ALTER TABLE ONLY logging.t_security_event
+    ADD CONSTRAINT t_security_event_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: t_security_event_tstamp_idx; Type: INDEX; Schema: logging; Owner: api
+--
+
+CREATE INDEX t_security_event_tstamp_idx ON logging.t_security_event USING btree (tstamp DESC);
+
+
+--
+-- Name: t_security_event_uuid_user_idx; Type: INDEX; Schema: logging; Owner: api
+--
+
+CREATE INDEX t_security_event_uuid_user_idx ON logging.t_security_event USING btree (uuid_user, tstamp DESC);
+
+
+--
+-- Name: t_security_event_event_idx; Type: INDEX; Schema: logging; Owner: api
+--
+
+CREATE INDEX t_security_event_event_idx ON logging.t_security_event USING btree (event, outcome, tstamp DESC);
+
+
+--
+-- Name: t_history_uuid_user_idx; Type: INDEX; Schema: logging; Owner: api
+--
+
+CREATE INDEX t_history_uuid_user_idx ON logging.t_history USING btree (uuid_user, tstamp DESC);
 
 
 --
@@ -561,17 +702,17 @@ CREATE TABLE public.attribute
 (
     uuid_metaobject     uuid NOT NULL,
     multi_valued        boolean,
-    default_value       text,
+    default_value       text NOT NULL DEFAULT '',
     attribute_type_uuid uuid NOT NULL,
-    facets              text,
+    facets              text NOT NULL DEFAULT '',
     min                 integer,
     max                 integer
 );
 
 comment on table public.attribute is 'this is the table for the meta attributes';
 comment on column public.attribute.multi_valued is 'this is the flag if the attribute is multi valued';
-comment on column public.attribute.default_value is 'this is the default value for the attribute';
-comment on column public.attribute.facets is 'this is if the attribute is an enum type';
+comment on column public.attribute.default_value is 'The value an instance of this attribute starts out holding. Empty means the attribute starts out unset, which is allowed only where the attribute type''s regex_value accepts an empty value - there is no separate placeholder for an unset value';
+comment on column public.attribute.facets is 'The values this attribute may take, separated by |: the choices of a dropdown, or the minimum, maximum and step of a slider. Each of them has to match the attribute type''s regex_value. Empty means no facets';
 
 ALTER TABLE public.attribute
     OWNER TO api;
@@ -585,7 +726,7 @@ CREATE TABLE public.attribute_instance
     uuid_instance_object         uuid NOT NULL,
     uuid_attribute               uuid,
     is_propagated                boolean,
-    value                        text,
+    value                        text NOT NULL DEFAULT '',
     assigned_uuid_scene_instance uuid,
     assigned_uuid_class_instance uuid,
     assigned_uuid_port_instance  uuid,
@@ -597,6 +738,8 @@ CREATE TABLE public.attribute_instance
 
 ALTER TABLE public.attribute_instance
     OWNER TO api;
+
+comment on column public.attribute_instance.value is 'The value held by this attribute instance. Empty is the value an attribute holds until someone fills it in, and the regex_value of its attribute type decides whether that is allowed';
 
 --
 -- Name: attribute_propagating_relationclass; Type: TABLE; Schema: public; Owner: api
@@ -864,8 +1007,7 @@ CREATE TABLE public.has_delete_right
 (
     id integer NOT NULL GENERATED ALWAYS AS IDENTITY,
     uuid_user_group      uuid,
-    uuid_metaobject      uuid,
-    uuid_instance_object uuid
+    uuid_metaobject      uuid
 );
 
 
@@ -918,8 +1060,7 @@ CREATE TABLE public.has_read_right
 (
     id integer NOT NULL GENERATED ALWAYS AS IDENTITY,
     uuid_user_group      uuid,
-    uuid_metaobject      uuid,
-    uuid_instance_object uuid
+    uuid_metaobject      uuid
 );
 
 
@@ -971,7 +1112,7 @@ ALTER TABLE public.has_read_right
 
 CREATE TABLE public.has_table_attribute
 (
-    sequence            integer,
+    sequence            integer NOT NULL,
     uuid_attribute_type uuid NOT NULL,
     uuid_attribute      uuid NOT NULL,
     ui_component        text NOT NULL DEFAULT 'text'
@@ -993,6 +1134,10 @@ COMMENT ON TABLE public.has_table_attribute IS 'This table give the possibility 
 --
 
 COMMENT ON COLUMN public.has_table_attribute.uuid_attribute_type IS 'This is the link to the attribute type "table x" for example';
+
+COMMENT ON COLUMN public.has_table_attribute.uuid_attribute IS 'The attribute a column holds: every cell of the column is an attribute_instance of it';
+
+COMMENT ON COLUMN public.has_table_attribute.sequence IS 'Position of the column in its table, starting at 1 and unique per attribute type';
 
 
 --
@@ -1017,8 +1162,7 @@ CREATE TABLE public.has_write_right
 (
     id integer NOT NULL GENERATED ALWAYS AS IDENTITY,
     uuid_user_group      uuid,
-    uuid_metaobject      uuid,
-    uuid_instance_object uuid
+    uuid_metaobject      uuid
 );
 
 
@@ -1387,6 +1531,23 @@ ALTER TABLE public.scene_instance
     OWNER TO api;
 
 --
+-- Name: scene_instance_user_access; Type: TABLE; Schema: public; Owner: api
+--
+
+CREATE TABLE public.scene_instance_user_access
+(
+    uuid_scene_instance uuid NOT NULL,
+    uuid_user           uuid NOT NULL,
+    read_access         boolean,
+    edit_access        boolean,
+    delete_access       boolean
+);
+
+
+ALTER TABLE public.scene_instance_user_access
+    OWNER TO api;
+
+--
 -- Name: scene_type; Type: TABLE; Schema: public; Owner: api
 --
 
@@ -1430,7 +1591,14 @@ CREATE TABLE public.user_group
     can_create_port           boolean not null default false,
     can_create_role           boolean not null default false,
     can_create_procedure  boolean not null default false,
-    can_create_user_group boolean not null default false
+    can_create_user_group boolean not null default false,
+
+    -- Membership of a group carrying this flag makes a user an administrator:
+    -- every right check below passes unconditionally, and only administrators may
+    -- create accounts. It replaces a hardcoded user uuid that was written into
+    -- each of those checks, which could be granted to nobody else and revoked
+    -- from nobody at all. A deployment may define more than one such group.
+    is_administrator      boolean not null default false
 
 );
 
@@ -1464,6 +1632,32 @@ CREATE TABLE public.users
 
 
 ALTER TABLE public.users
+    OWNER TO api;
+
+--
+-- Name: is_administrator; Type: FUNCTION; Schema: public; Owner: api
+--
+-- Whether a user belongs to any group flagged as administrative. Every right
+-- check in the application ends with a call to this, which is the single place
+-- the privilege is defined. Passing NULL — an unauthenticated caller — is not an
+-- administrator.
+--
+CREATE OR REPLACE FUNCTION public.is_administrator(p_user uuid)
+    RETURNS boolean
+    LANGUAGE sql
+    STABLE
+    PARALLEL SAFE
+AS
+$$
+SELECT EXISTS (SELECT 1
+               FROM public.user_group ug
+                        JOIN public.has_user_user_group huug
+                             ON huug.uuid_user_group = ug.uuid_metaobject
+               WHERE huug.uuid_user = p_user
+                 AND ug.is_administrator);
+$$;
+
+ALTER FUNCTION public.is_administrator(uuid)
     OWNER TO api;
 
 --
@@ -1531,6 +1725,26 @@ VALUES ('03f0cbf8-0278-4c85-8130-28aed970284f', 'test', '$2a$10$oPU3HTi7gV6tkKbB
 INSERT INTO public.users (uuid_metaobject, username, password, salt, token)
 VALUES ('ff892138-77e0-47fe-a323-3fe0e1bf0240', 'admin', '$2a$10$VC0PBQ7djoHjtubEahV7XexPW.B8x7dDUBQ6l9LEiOjLMmewiWTJy',
         NULL, NULL);
+
+-- ---------------------
+-- administrators
+-- ---------------------
+-- The group that carries the administrative privilege, and the seeded admin
+-- account's membership of it. Administrator status is membership of a group
+-- flagged is_administrator, so it can be granted and revoked through the normal
+-- user group API; nothing in the code names this particular group.
+INSERT INTO public.metaobject (uuid, name, description, creation_time, modification_time)
+VALUES ('014db23f-3d88-4643-b54d-eef6df4e57ae', 'administrators',
+        'Members of this group hold every right and are the only users who may create accounts.',
+        now(), now());
+
+INSERT INTO public.user_group (uuid_metaobject, is_administrator, can_create_scenetype, can_create_attribute,
+                               can_create_attribute_type, can_create_class, can_create_relationclass,
+                               can_create_port, can_create_role, can_create_procedure, can_create_user_group)
+VALUES ('014db23f-3d88-4643-b54d-eef6df4e57ae', true, true, true, true, true, true, true, true, true, true);
+
+INSERT INTO public.has_user_user_group (uuid_user, uuid_user_group)
+VALUES ('ff892138-77e0-47fe-a323-3fe0e1bf0240', '014db23f-3d88-4643-b54d-eef6df4e57ae');
 -- ---------------------
 -- attribute_types
 -- ---------------------
@@ -1622,6 +1836,29 @@ ALTER TABLE ONLY public.assigned_to_scene
 
 ALTER TABLE ONLY public.attribute_instance
     ADD CONSTRAINT attribute_instance_pkey PRIMARY KEY (uuid_instance_object);
+
+
+--
+-- Name: attribute_instance attribute_instance_table_cell_row; Type: CONSTRAINT; Schema: public; Owner: api
+--
+-- A table cell is an attribute_instance whose table_attribute_reference names the
+-- table (itself an attribute_instance) it belongs to. Exactly the cells carry a row,
+-- counted from 0.
+--
+
+ALTER TABLE ONLY public.attribute_instance
+    ADD CONSTRAINT attribute_instance_table_cell_row CHECK (((table_attribute_reference IS NULL) = (table_row IS NULL)) AND (table_row >= 0));
+
+
+--
+-- Name: attribute_instance attribute_instance_table_cell_unique; Type: CONSTRAINT; Schema: public; Owner: api
+--
+-- One cell per row and column of a table. Deferred, because removing a row renumbers
+-- the rows below it one statement at a time.
+--
+
+ALTER TABLE ONLY public.attribute_instance
+    ADD CONSTRAINT attribute_instance_table_cell_unique UNIQUE (table_attribute_reference, table_row, uuid_attribute) DEFERRABLE INITIALLY DEFERRED;
 
 
 --
@@ -1803,6 +2040,24 @@ ALTER TABLE ONLY public.has_table_attribute
 
 
 --
+-- Name: has_table_attribute has_table_attribute_sequence; Type: CONSTRAINT; Schema: public; Owner: api
+--
+
+ALTER TABLE ONLY public.has_table_attribute
+    ADD CONSTRAINT has_table_attribute_sequence CHECK (sequence >= 1);
+
+
+--
+-- Name: has_table_attribute has_table_attribute_sequence_unique; Type: CONSTRAINT; Schema: public; Owner: api
+--
+-- Deferred, because reordering columns swaps their sequences one statement at a time.
+--
+
+ALTER TABLE ONLY public.has_table_attribute
+    ADD CONSTRAINT has_table_attribute_sequence_unique UNIQUE (uuid_attribute_type, sequence) DEFERRABLE INITIALLY DEFERRED;
+
+
+--
 -- Name: has_user_user_group has_user_user_group_pkey; Type: CONSTRAINT; Schema: public; Owner: api
 --
 
@@ -1969,6 +2224,14 @@ ALTER TABLE ONLY public.scene_has_attributes
 
 ALTER TABLE ONLY public.scene_instance
     ADD CONSTRAINT scene_instance_pkey PRIMARY KEY (uuid_instance_object);
+
+
+--
+-- Name: scene_instance_user_access scene_instance_user_access_pkey; Type: CONSTRAINT; Schema: public; Owner: api
+--
+
+ALTER TABLE ONLY public.scene_instance_user_access
+    ADD CONSTRAINT scene_instance_user_access_pkey PRIMARY KEY (uuid_scene_instance, uuid_user);
 
 
 --
@@ -2489,14 +2752,6 @@ ALTER TABLE ONLY public.generic_constraint
 
 
 --
--- Name: has_delete_right fk_has_delete_right_instanceobject; Type: FK CONSTRAINT; Schema: public; Owner: api
---
-
-ALTER TABLE ONLY public.has_delete_right
-    ADD CONSTRAINT fk_has_delete_right_instanceobject FOREIGN KEY (uuid_instance_object) REFERENCES public.instance_object (uuid) ON UPDATE CASCADE ON DELETE CASCADE;
-
-
---
 -- Name: has_delete_right fk_has_delete_right_metaobject; Type: FK CONSTRAINT; Schema: public; Owner: api
 --
 
@@ -2511,13 +2766,9 @@ ALTER TABLE ONLY public.has_delete_right
 ALTER TABLE ONLY public.has_delete_right
     ADD CONSTRAINT fk_has_delete_right_user_group FOREIGN KEY (uuid_user_group) REFERENCES public.user_group (uuid_metaobject) ON UPDATE CASCADE ON DELETE CASCADE;
 
-
---
--- Name: has_read_right fk_has_read_right_instanceobject; Type: FK CONSTRAINT; Schema: public; Owner: api
---
-
-ALTER TABLE ONLY public.has_read_right
-    ADD CONSTRAINT fk_has_read_right_instanceobject FOREIGN KEY (uuid_instance_object) REFERENCES public.instance_object (uuid) ON UPDATE CASCADE ON DELETE cascade;
+ALTER TABLE ONLY public.has_delete_right
+    ADD CONSTRAINT unique_usergroup_metaobject_delete
+    UNIQUE (uuid_user_group, uuid_metaobject);
 
 
 --
@@ -2534,6 +2785,10 @@ ALTER TABLE ONLY public.has_read_right
 
 ALTER TABLE ONLY public.has_read_right
     ADD CONSTRAINT fk_has_read_right_user_group FOREIGN KEY (uuid_user_group) REFERENCES public.user_group (uuid_metaobject) ON UPDATE CASCADE ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.has_read_right
+    ADD CONSTRAINT unique_usergroup_metaobject_read
+    UNIQUE (uuid_user_group, uuid_metaobject);
 
 
 --
@@ -2553,14 +2808,6 @@ ALTER TABLE ONLY public.has_user_user_group
 
 
 --
--- Name: has_write_right fk_has_write_right_instanceobject; Type: FK CONSTRAINT; Schema: public; Owner: api
---
-
-ALTER TABLE ONLY public.has_write_right
-    ADD CONSTRAINT fk_has_write_right_instanceobject FOREIGN KEY (uuid_instance_object) REFERENCES public.instance_object (uuid) ON UPDATE CASCADE ON DELETE CASCADE;
-
-
---
 -- Name: has_write_right fk_has_write_right_metaobject; Type: FK CONSTRAINT; Schema: public; Owner: api
 --
 
@@ -2574,6 +2821,10 @@ ALTER TABLE ONLY public.has_write_right
 
 ALTER TABLE ONLY public.has_write_right
     ADD CONSTRAINT fk_has_write_right_user_group FOREIGN KEY (uuid_user_group) REFERENCES public.user_group (uuid_metaobject) ON UPDATE CASCADE ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.has_write_right
+    ADD CONSTRAINT unique_usergroup_metaobject_write
+    UNIQUE (uuid_user_group, uuid_metaobject);
 
 
 
@@ -2935,6 +3186,22 @@ ALTER TABLE ONLY public.scene_instance
 
 
 --
+-- Name: scene_instance_user_access fk_scene_instance_user_access_scene_instance; Type: FK CONSTRAINT; Schema: public; Owner: api
+--
+
+ALTER TABLE ONLY public.scene_instance_user_access
+    ADD CONSTRAINT fk_scene_instance_user_access_scene_instance FOREIGN KEY (uuid_scene_instance) REFERENCES public.scene_instance (uuid_instance_object) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
+-- Name: scene_instance_user_access fk_scene_instance_user_access_user; Type: FK CONSTRAINT; Schema: public; Owner: api
+--
+
+ALTER TABLE ONLY public.scene_instance_user_access
+    ADD CONSTRAINT fk_scene_instance_user_access_user FOREIGN KEY (uuid_user) REFERENCES public.users (uuid_metaobject) ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+--
 -- Name: scene_type fk_scene_metaobject; Type: FK CONSTRAINT; Schema: public; Owner: api
 --
 
@@ -2979,6 +3246,10 @@ ALTER TABLE ONLY public.can_create_instances
 
 ALTER TABLE ONLY public.can_create_instances
     ADD CONSTRAINT fk_can_create_instances_meta_object FOREIGN KEY (uuid_metaobject) REFERENCES public.metaobject (uuid) ON UPDATE CASCADE ON DELETE CASCADE;
+
+ALTER TABLE ONLY public.can_create_instances
+    ADD CONSTRAINT unique_usergroup_metaobject_create
+    UNIQUE (uuid_user_group, uuid_metaobject);
 --
 -- Name: users fk_user_metaobject; Type: FK CONSTRAINT; Schema: public; Owner: api
 --
@@ -3049,3 +3320,77 @@ ALTER DEFAULT PRIVILEGES FOR ROLE api GRANT ALL ON TABLES TO api WITH GRANT OPTI
 --
 
 
+
+
+--
+-- Name: foreign key indexes; Type: INDEX; Schema: public; Owner: api
+--
+-- PostgreSQL creates an index for a primary key or a unique constraint, never for a
+-- foreign key. Every one of the columns below is what some query filters or joins
+-- on to walk from a parent to its children -- the attributes of a class, the classes
+-- of a scene, the rights of a user -- so without these each of those lookups is a
+-- sequential scan of the whole table.
+--
+-- The three right-check indexes are composite rather than single-column because the
+-- checks filter on the metaobject and join on the group in the same query.
+--
+
+CREATE INDEX IF NOT EXISTS assigned_to_scene_uuid_scene_instance_idx ON public.assigned_to_scene USING btree (uuid_scene_instance);
+CREATE INDEX IF NOT EXISTS attribute_attribute_type_uuid_idx ON public.attribute USING btree (attribute_type_uuid);
+CREATE INDEX IF NOT EXISTS attribute_instance_assigned_uuid_class_instance_idx ON public.attribute_instance USING btree (assigned_uuid_class_instance);
+CREATE INDEX IF NOT EXISTS attribute_instance_assigned_uuid_port_instance_idx ON public.attribute_instance USING btree (assigned_uuid_port_instance);
+CREATE INDEX IF NOT EXISTS attribute_instance_assigned_uuid_scene_instance_idx ON public.attribute_instance USING btree (assigned_uuid_scene_instance);
+CREATE INDEX IF NOT EXISTS attribute_instance_role_instance_from_idx ON public.attribute_instance USING btree (role_instance_from);
+CREATE INDEX IF NOT EXISTS attribute_instance_table_attribute_reference_idx ON public.attribute_instance USING btree (table_attribute_reference);
+CREATE INDEX IF NOT EXISTS attribute_instance_uuid_attribute_idx ON public.attribute_instance USING btree (uuid_attribute);
+CREATE INDEX IF NOT EXISTS class_aggregation_reference_uuid_contained_class_instance_idx ON public.class_aggregation_reference USING btree (uuid_contained_class_instance);
+CREATE INDEX IF NOT EXISTS class_decomposition_reference_uuid_decomposed_class_instanc_idx ON public.class_decomposition_reference USING btree (uuid_decomposed_class_instance);
+CREATE INDEX IF NOT EXISTS class_has_attributes_uuid_attribute_idx ON public.class_has_attributes USING btree (uuid_attribute);
+CREATE INDEX IF NOT EXISTS class_instance_uuid_aggregator_class_idx ON public.class_instance USING btree (uuid_aggregator_class);
+CREATE INDEX IF NOT EXISTS class_instance_uuid_class_idx ON public.class_instance USING btree (uuid_class);
+CREATE INDEX IF NOT EXISTS class_instance_uuid_decomposable_class_idx ON public.class_instance USING btree (uuid_decomposable_class);
+CREATE INDEX IF NOT EXISTS class_instance_uuid_relationclass_bendpoint_idx ON public.class_instance USING btree (uuid_relationclass_bendpoint);
+CREATE INDEX IF NOT EXISTS contains_aggreg_classes_uuid_aggregator_class_idx ON public.contains_aggreg_classes USING btree (uuid_aggregator_class);
+CREATE INDEX IF NOT EXISTS contains_aggreg_relationclasses_uuid_aggregator_class_idx ON public.contains_aggreg_relationclasses USING btree (uuid_aggregator_class);
+CREATE INDEX IF NOT EXISTS contains_classes_uuid_scene_type_idx ON public.contains_classes USING btree (uuid_scene_type);
+CREATE INDEX IF NOT EXISTS decomposable_into_aggregator_classes_uuid_aggregator_class_idx ON public.decomposable_into_aggregator_classes USING btree (uuid_aggregator_class);
+CREATE INDEX IF NOT EXISTS decomposable_into_classes_uuid_class_idx ON public.decomposable_into_classes USING btree (uuid_class);
+CREATE INDEX IF NOT EXISTS decomposable_into_scenes_uuid_scene_type_idx ON public.decomposable_into_scenes USING btree (uuid_scene_type);
+CREATE INDEX IF NOT EXISTS generic_constraint_assigned_uuid_metaobject_idx ON public.generic_constraint USING btree (assigned_uuid_metaobject);
+CREATE INDEX IF NOT EXISTS has_algorithm_uuid_procedure_idx ON public.has_algorithm USING btree (uuid_procedure);
+CREATE INDEX IF NOT EXISTS has_delete_right_uuid_metaobject_uuid_user_group_idx ON public.has_delete_right USING btree (uuid_metaobject, uuid_user_group);
+CREATE INDEX IF NOT EXISTS has_read_right_uuid_metaobject_uuid_user_group_idx ON public.has_read_right USING btree (uuid_metaobject, uuid_user_group);
+CREATE INDEX IF NOT EXISTS has_table_attribute_uuid_attribute_type_idx ON public.has_table_attribute USING btree (uuid_attribute_type);
+CREATE INDEX IF NOT EXISTS has_user_user_group_uuid_user_group_idx ON public.has_user_user_group USING btree (uuid_user_group);
+CREATE INDEX IF NOT EXISTS has_write_right_uuid_metaobject_uuid_user_group_idx ON public.has_write_right USING btree (uuid_metaobject, uuid_user_group);
+CREATE INDEX IF NOT EXISTS is_sub_scene_uuid_sub_scene_type_idx ON public.is_sub_scene USING btree (uuid_sub_scene_type);
+CREATE INDEX IF NOT EXISTS is_subclass_of_uuid_class_idx ON public.is_subclass_of USING btree (uuid_class);
+CREATE INDEX IF NOT EXISTS port_uuid_class_idx ON public.port USING btree (uuid_class);
+CREATE INDEX IF NOT EXISTS port_uuid_scene_type_idx ON public.port USING btree (uuid_scene_type);
+CREATE INDEX IF NOT EXISTS port_has_attributes_uuid_attribute_idx ON public.port_has_attributes USING btree (uuid_attribute);
+CREATE INDEX IF NOT EXISTS port_instance_uuid_class_instance_idx ON public.port_instance USING btree (uuid_class_instance);
+CREATE INDEX IF NOT EXISTS port_instance_uuid_port_idx ON public.port_instance USING btree (uuid_port);
+CREATE INDEX IF NOT EXISTS port_instance_uuid_scene_instance_idx ON public.port_instance USING btree (uuid_scene_instance);
+CREATE INDEX IF NOT EXISTS relationclass_role_from_idx ON public.relationclass USING btree (role_from);
+CREATE INDEX IF NOT EXISTS relationclass_role_to_idx ON public.relationclass USING btree (role_to);
+CREATE INDEX IF NOT EXISTS relationclass_uuid_class_bendpoint_idx ON public.relationclass USING btree (uuid_class_bendpoint);
+CREATE INDEX IF NOT EXISTS relationclass_instance_uuid_role_instance_from_idx ON public.relationclass_instance USING btree (uuid_role_instance_from);
+CREATE INDEX IF NOT EXISTS relationclass_instance_uuid_role_instance_to_idx ON public.relationclass_instance USING btree (uuid_role_instance_to);
+CREATE INDEX IF NOT EXISTS role_uuid_attribute_type_idx ON public.role USING btree (uuid_attribute_type);
+CREATE INDEX IF NOT EXISTS role_attribute_reference_uuid_attribute_idx ON public.role_attribute_reference USING btree (uuid_attribute);
+CREATE INDEX IF NOT EXISTS role_class_reference_uuid_class_idx ON public.role_class_reference USING btree (uuid_class);
+CREATE INDEX IF NOT EXISTS role_instance_uuid_has_reference_attribute_instance_idx ON public.role_instance USING btree (uuid_has_reference_attribute_instance);
+CREATE INDEX IF NOT EXISTS role_instance_uuid_has_reference_class_instance_idx ON public.role_instance USING btree (uuid_has_reference_class_instance);
+CREATE INDEX IF NOT EXISTS role_instance_uuid_has_reference_port_instance_idx ON public.role_instance USING btree (uuid_has_reference_port_instance);
+CREATE INDEX IF NOT EXISTS role_instance_uuid_has_reference_relationclass_instance_idx ON public.role_instance USING btree (uuid_has_reference_relationclass_instance);
+CREATE INDEX IF NOT EXISTS role_instance_uuid_has_reference_scene_instance_idx ON public.role_instance USING btree (uuid_has_reference_scene_instance);
+CREATE INDEX IF NOT EXISTS role_instance_uuid_role_idx ON public.role_instance USING btree (uuid_role);
+CREATE INDEX IF NOT EXISTS role_port_reference_uuid_port_idx ON public.role_port_reference USING btree (uuid_port);
+CREATE INDEX IF NOT EXISTS role_relationclass_reference_uuid_relationclass_idx ON public.role_relationclass_reference USING btree (uuid_relationclass);
+CREATE INDEX IF NOT EXISTS role_scene_reference_uuid_scene_type_idx ON public.role_scene_reference USING btree (uuid_scene_type);
+CREATE INDEX IF NOT EXISTS scene_decomposition_reference_uuid_scene_instance_idx ON public.scene_decomposition_reference USING btree (uuid_scene_instance);
+CREATE INDEX IF NOT EXISTS scene_group_is_subgroup_of_idx ON public.scene_group USING btree (is_subgroup_of);
+CREATE INDEX IF NOT EXISTS scene_has_attributes_uuid_attribute_idx ON public.scene_has_attributes USING btree (uuid_attribute);
+CREATE INDEX IF NOT EXISTS scene_instance_uuid_scene_type_idx ON public.scene_instance USING btree (uuid_scene_type);
+CREATE INDEX IF NOT EXISTS scene_instance_user_access_uuid_user_idx ON public.scene_instance_user_access USING btree (uuid_user);
+CREATE INDEX IF NOT EXISTS selected_propagation_attributes_uuid_attribute_idx ON public.selected_propagation_attributes USING btree (uuid_attribute);
